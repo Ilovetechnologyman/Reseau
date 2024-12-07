@@ -36,11 +36,13 @@ int main(){
     socklen_t client_len = sizeof(clien_addr);
     int a = accept(sockfd, (struct sockaddr *) &clien_addr, &client_len);
     char buffer[1024];
+    bzerro(buffer,1024);
     for(int i = 0;i<100;i++){
         recv(a,buffer,1024,0);
         printf("Client : %s \n",buffer);
         send(a,"bien recu \n",12,0);
     }
-
+    close(a);
+    close(sockfd);
     return 0;
 }

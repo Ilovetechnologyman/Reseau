@@ -27,4 +27,5 @@ int main(){
         buffer[bytes_received] = '\0';
         printf("Server : %s \n",buffer);
     }
+    close(sockfd);
 }
