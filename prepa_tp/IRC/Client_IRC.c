@@ -9,12 +9,19 @@
 #include <sys/time.h>
 #include <pthread.h>
 #include <netdb.h>
+#include <time.h>
 
 #define BUFFER_SIZE 2048
-#define NTP_TIMESTAMP_DELTA 2208988800ull
+#define MAX_PSEUDO_LENGTH 32
+#define NTP_TIMESTAMP_DELTA 2208988800ull // Seconds between 1900 and 1970
 #define NTP_SERVER "pool.ntp.org"
+#define NTP_PORT 123
 
-// Structure pour le paquet NTP
+typedef struct {
+    uint32_t integer;
+    uint32_t fractional;
+} ntp_timestamp_t;
+
 typedef struct {
     uint8_t li_vn_mode;
     uint8_t stratum;
@@ -23,119 +30,131 @@ typedef struct {
     uint32_t root_delay;
     uint32_t root_dispersion;
     uint32_t ref_id;
-    uint32_t ref_ts_sec;
-    uint32_t ref_ts_frac;
-    uint32_t orig_ts_sec;
-    uint32_t orig_ts_frac;
-    uint32_t recv_ts_sec;
-    uint32_t recv_ts_frac;
-    uint32_t trans_ts_sec;
-    uint32_t trans_ts_frac;
+    ntp_timestamp_t reference_ts;
+    ntp_timestamp_t originate_ts;
+    ntp_timestamp_t receive_ts;
+    ntp_timestamp_t transmit_ts;
 } ntp_packet;
 
-// Fonction pour obtenir l'heure NTP
 time_t get_ntp_time() {
     int sockfd;
-    struct hostent *server;
     struct sockaddr_in serv_addr;
     ntp_packet packet = { 0 };
     
     packet.li_vn_mode = 0x1b; // Version 3, Mode 3 (client)
     
     sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    server = gethostbyname(NTP_SERVER);
+    if (sockfd < 0) return time(NULL); // Fallback to system time
     
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
-    memcpy(&serv_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
-    serv_addr.sin_port = htons(123);
+    serv_addr.sin_port = htons(NTP_PORT);
     
-    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        return time(NULL); // Fallback to system time
-    }
-    
-    if (send(sockfd, &packet, sizeof(ntp_packet), 0) < 0) {
+    struct hostent *server = gethostbyname(NTP_SERVER);
+    if (!server) {
         close(sockfd);
         return time(NULL);
     }
     
-    if (recv(sockfd, &packet, sizeof(ntp_packet), 0) < 0) {
+    memcpy(&serv_addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
+    
+    if (sendto(sockfd, &packet, sizeof(ntp_packet), 0,
+               (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(sockfd);
+        return time(NULL);
+    }
+    
+    struct timeval timeout = {1, 0}; // 1 second timeout
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    if (recvfrom(sockfd, &packet, sizeof(ntp_packet), 0, NULL, NULL) < 0) {
         close(sockfd);
         return time(NULL);
     }
     
     close(sockfd);
-    return ntohl(packet.trans_ts_sec) - NTP_TIMESTAMP_DELTA;
+    
+    packet.transmit_ts.integer = ntohl(packet.transmit_ts.integer);
+    return packet.transmit_ts.integer - NTP_TIMESTAMP_DELTA;
 }
 
-void *receive_messages(void *socket_desc) {
-    int sock = *(int*)socket_desc;
-    char buffer[BUFFER_SIZE];
-    int read_size;
-    
-    while((read_size = recv(sock, buffer, BUFFER_SIZE, 0)) > 0) {
-        buffer[read_size] = '\0';
-        time_t ntp_time = get_ntp_time();
-        struct tm *time_info = localtime(&ntp_time);
-        printf("[%02d:%02d:%02d] %s", 
-               time_info->tm_hour,
-               time_info->tm_min,
-               time_info->tm_sec,
-               buffer);
-    }
-    return NULL;
+void print_time_message(const char *message) {
+    time_t ntp_time = get_ntp_time();
+    char time_str[26];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", localtime(&ntp_time));
+    printf("[%s] %s", time_str, message);
+}
+
+void stop(char * message){
+    perror(message);
+    exit(EXIT_FAILURE);
 }
 
 int main(int argc, char *argv[]) {
-    if(argc != 3) {
+    if (argc != 3) {
         printf("Usage: %s <IP> <port>\n", argv[0]);
-        return 1;
+        exit(EXIT_FAILURE);
     }
 
-    int sock;
-    struct sockaddr_in server;
-    char pseudo[32];
-    char message[BUFFER_SIZE];
-    pthread_t thread_id;
-
-    // Create socket
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == -1) {
-        printf("Could not create socket");
-        return 1;
+    char pseudo[MAX_PSEUDO_LENGTH];
+    printf("Entrez votre pseudo : ");
+    if (fgets(pseudo, MAX_PSEUDO_LENGTH, stdin) == NULL) {
+        stop("Erreur de lecture du pseudo");
     }
-
-    server.sin_addr.s_addr = inet_addr(argv[1]);
-    server.sin_family = AF_INET;
-    server.sin_port = htons(atoi(argv[2]));
-
-    // Connect to server
-    if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0) {
-        perror("Connect failed");
-        return 1;
-    }
-
-    printf("Enter your pseudo: ");
-    fgets(pseudo, 32, stdin);
+    // Supprimer le retour à la ligne
     pseudo[strcspn(pseudo, "\n")] = 0;
 
-    // Send pseudo to server
-    send(sock, pseudo, strlen(pseudo), 0);
+    char *server_ip = argv[1];
+    int server_port = atoi(argv[2]);
+    int clisockfd;
+    clisockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if(clisockfd < 0) stop("socket()");
+    //deff du serveur
+    struct sockaddr_in serv_addr;
+    memset((char *) &serv_addr, 0,sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(server_port);
+    serv_addr.sin_addr.s_addr = inet_addr(server_ip);
+    if (connect(clisockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) stop("connect()");
 
-    // Create thread for receiving messages
-    if(pthread_create(&thread_id, NULL, receive_messages, (void*)&sock) < 0) {
-        perror("Could not create thread");
-        return 1;
+    // Envoi du pseudo
+    if (send(clisockfd, pseudo, strlen(pseudo), 0) < 0) {
+        stop("Erreur d'envoi du pseudo");
     }
 
-    // Main loop for sending messages
-    while(1) {
-        fgets(message, BUFFER_SIZE, stdin);
-        if(send(sock, message, strlen(message), 0) < 0) {
-            puts("Send failed");
-            return 1;
+    char buffer[BUFFER_SIZE];
+    ssize_t recv_size;
+
+    // Réception du message de bienvenue
+    recv_size = recv(clisockfd, buffer, sizeof(buffer)-1, 0);
+    if (recv_size > 0) {
+        buffer[recv_size] = '\0';
+        printf("%s", buffer);
+    }
+
+    // Boucle principale de chat
+    while (1) {
+        memset(buffer, 0, sizeof(buffer));
+        if (fgets(buffer, BUFFER_SIZE, stdin) != NULL) {
+            send(clisockfd, buffer, strlen(buffer), 0);
+        }
+
+        // Vérifier s'il y a des messages à recevoir
+        fd_set readfds;
+        struct timeval tv = {0, 100000}; // 100ms timeout
+        FD_ZERO(&readfds);
+        FD_SET(clisockfd, &readfds);
+        
+        if (select(clisockfd + 1, &readfds, NULL, NULL, &tv) > 0) {
+            memset(buffer, 0, sizeof(buffer));
+            recv_size = recv(clisockfd, buffer, sizeof(buffer)-1, 0);
+            if (recv_size > 0) {
+                buffer[recv_size] = '\0';
+                print_time_message(buffer);
+            }
         }
     }
 
+    close(clisockfd);
     return 0;
 }
